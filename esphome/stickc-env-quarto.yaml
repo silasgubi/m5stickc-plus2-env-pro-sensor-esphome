@@ -1,0 +1,1507 @@
+# =============================================================================
+# STICKC ENV QUARTO - M5StickC PLUS2 + ENV Pro (BME688) via BSEC2
+# =============================================================================
+# Project: bedroom environmental sensor; its readings can feed a Home Assistant
+# air-conditioning automation.
+#
+# Hardware: M5StickC PLUS2 (ESP32-PICO-V3-02, 2MB PSRAM quad, 8MB flash, no
+# AXP192) + M5Stack ENV Pro (BME688) on the Grove port.
+#
+# Pinout confirmed on real hardware (see docs/hardware-wiring.md):
+# - Grove (BME688):      SDA=GPIO32 SCL=GPIO33, addr 0x77
+# - Internal I2C (IMU+RTC): SDA=GPIO21 SCL=GPIO22 (MPU6886 0x68, BM8563 0x51)
+# - Display ST7789V2:    CS=5 DC=14 RST=12, SPI CLK=13 MOSI=15, backlight=27 PWM
+#   Panel quirk: needs offset_width=52 / offset_height=40 (without it the
+#   screen stays black/blank: content is drawn outside the visible window).
+#   invert_colors is NOT needed in this rotation (tested live).
+# - Screen (since 2026-10-09): landscape, device lying down with the USB-C on
+#   the right (rotation 90, 240x135). Three pages plus a status bar on the
+#   LVGL top layer (Wi-Fi dots, lightning bolt on USB power, battery,
+#   "select ^" on page 3):
+#   1 temperature / humidity / air quality, 2 pressure / gas / IAQ / IAQ
+#   accuracy, 3 settings (sound alert and light alert, ON/OFF).
+#   No clock (there are several in the bedroom).
+# - Buttons: A (M5, right of the screen) = next page; on page 3 it walks the
+#   cursor through the four ON/OFF options, then back to page 1. Hold 5 s =
+#   restart. B (side button, now on top) = on page 3 applies the option under
+#   the cursor; hold 8 s = factory reset. Pages 2 and 3 return to page 1 on
+#   their own (30 s / 15 s). Brightness and color theme: Home Assistant only.
+#   C=35 (wake, HW, no logic in ESPHome)
+# - Motion wake (2026-10-13): with the screen off, moving the device (MPU6886
+#   accelerometer) wakes it exactly like an A press; switch "Acordar com
+#   Movimento" in Home Assistant turns it off. Only on USB power ("Cabo USB",
+#   inferred from the battery voltage): on battery the IMU drops back to one
+#   read per minute.
+# - Battery: ADC GPIO38, x2 voltage divider, range 3.27V(0%)-4.15V(100%)
+# - No brightness schedule in the firmware: a Home Assistant sleep-mode
+#   automation turns the screen off and on. The color theme never changes by itself.
+#
+# secrets.yaml: stickc_env_quarto_api_key / stickc_env_quarto_ota_password
+#               stickc_env_quarto_ap_password / wifi_ssid / wifi_password
+# =============================================================================
+
+substitutions:
+  name: stickc-env-quarto
+  friendly_name: StickC Env Quarto
+  # Motion wake sensitivity: distance in m/s^2 between the current
+  # acceleration and the slow reference. 1.0 is about 0.1 g, a ~6 degree
+  # tilt or a light tap; raise it if bumping the nightstand wakes the screen.
+  motion_threshold: "1.0"
+  # Self-heating offset in C, subtracted inside BSEC2 (temperature, humidity
+  # and IAQ). 1.8 is for THIS mounting only: on another build start at 0 and
+  # measure (README "Mounting and self-heating", docs/lessons-learned.md).
+  temperature_offset: "1.8"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  min_version: 2026.6.0
+  on_boot:
+    - priority: 800
+      then:
+        - switch.turn_on: power_hold
+    - priority: 200
+      then:
+        - script.execute: apply_manual_brightness
+        - script.execute: apply_theme_color
+        # The selects start at initial_option, not at the restored globals:
+        # after a reboot Home Assistant showed "Forte" while the screen was
+        # really at 40%. Sync them to the restored values.
+        - select.set:
+            id: brightness_select
+            option: !lambda 'return id(brightness_level_name) == "40" ? "Fraco" : "Forte";'
+        - select.set:
+            id: theme_select
+            option: !lambda |-
+              std::string c = id(theme_color_name);
+              if (c == "azul") return std::string("Azul");
+              if (c == "vermelho") return std::string("Vermelho");
+              if (c == "ambar") return std::string("Âmbar");
+              return std::string("Verde");
+    - priority: 100
+      then:
+        - script.execute:
+            id: beep
+            freq: 1500
+            dur_ms: 120
+
+esp32:
+  variant: esp32
+  flash_size: 8MB
+  # 160 MHz since 2026-10-08: less self-heating near the BME688; this
+  # firmware (sensor + small LVGL screen) does not need 240 MHz.
+  cpu_frequency: 160MHz
+  framework:
+    type: esp-idf
+
+psram:
+  mode: quad
+  speed: 80MHz
+
+api:
+  encryption:
+    key: !secret stickc_env_quarto_api_key
+
+ota:
+  - platform: esphome
+    password: !secret stickc_env_quarto_ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Back to light on 2026-10-08: "none" (2026-09-27, to rule out reconnects)
+  # keeps the radio always awake and the temperature error rose ~2 C. The
+  # device then ran 258 h without a reboot; watch reconnects for 48 h.
+  power_save_mode: light
+  ap:
+    ssid: "StickC-Env-Quarto Fallback"
+    password: !secret stickc_env_quarto_ap_password
+  on_connect:
+    - script.execute: update_wifi_dots
+  # Unlit dot = black fill inside the theme-colored ring (static color in
+  # YAML, so no inversion compensation here).
+  on_disconnect:
+    - lvgl.obj.update:
+        id: wifi_dot_1
+        bg_color: 0x000000
+    - lvgl.obj.update:
+        id: wifi_dot_2
+        bg_color: 0x000000
+    - lvgl.obj.update:
+        id: wifi_dot_3
+        bg_color: 0x000000
+    - lvgl.obj.update:
+        id: wifi_dot_4
+        bg_color: 0x000000
+
+logger:
+  level: INFO
+  logs:
+    sensor: WARN
+
+captive_portal:
+
+# --- Reboot/freeze diagnostics (2026-09-27). The reset reason
+# (watchdog/brownout/panic), free heap, largest contiguous block and uptime went
+# to HA to tell a memory crash from a power problem or a freeze without reboot.
+# See docs/lessons-learned.md. ---
+# Since 2026-10-08 only the reset reason is kept (protection kit); the heap
+# sensors were removed, see the note under sensor:.
+debug:
+  update_interval: 60s
+
+# --- Night brightness: there is NO time schedule here anymore. The firmware used to
+# set the screen to 5% at 22:00 and back to the manual level at 07:00, which fought with
+# Home Assistant (it relit the screen in the middle of the night). Now Home Assistant decides:
+# its sleep-mode automation turns the screen off at night and back on at the manual level
+# when night mode is turned off. We do not touch the theme color; it is always the
+# one chosen by the user. ---
+
+# --- Persistent state (survives reboot): color theme and brightness level
+# chosen by the user. current_page / cfg_cursor / cursor_blink_on do NOT
+# persist; they are only the screen navigation state. ---
+globals:
+  - id: theme_color_name
+    type: std::string
+    restore_value: true
+    initial_value: '"verde"'
+  - id: brightness_level_name
+    type: std::string
+    restore_value: true
+    initial_value: '"40"'
+    # Default Fraco since 2026-10-08: 100% measurably heats the BME688.
+    # Only "40" (Fraco) or "100" (Forte), reduced from 5 levels to 2: on the
+    # physical screen only two brightness levels were actually noticeable.
+  # Page shown on screen: 1 readings, 2 sensor details, 3 settings.
+  - id: current_page
+    type: int
+    restore_value: false
+    initial_value: "1"
+  # Page 3 cursor: 0 sound ON, 1 sound OFF, 2 light ON, 3 light OFF.
+  - id: cfg_cursor
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: cursor_blink_on
+    type: bool
+    restore_value: false
+    initial_value: "true"
+  # Screen woken by the M5 button while Home Assistant had it off; turns
+  # off again via wake_timeout.
+  - id: wake_mode
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  # Motion wake: slow-moving reference of the accelerometer vector (m/s^2).
+  # A reading that strays from it by more than motion_threshold counts as
+  # movement; the reference then catches up within a few seconds, so a
+  # device left in a new position goes quiet again.
+  - id: motion_ref_x
+    type: float
+    restore_value: false
+    initial_value: "0"
+  - id: motion_ref_y
+    type: float
+    restore_value: false
+    initial_value: "0"
+  - id: motion_ref_z
+    type: float
+    restore_value: false
+    initial_value: "0"
+  - id: motion_ref_valid
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: theme_color_hex_value
+    type: int
+    restore_value: false
+    initial_value: "0xA82683"
+  - id: iaq_alert_active
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: alert_led_state
+    type: bool
+    restore_value: false
+    initial_value: "false"
+
+# Pre-compensated theme colors: colors set via lv_color_hex() inside a
+# lambda come out INVERTED on screen (a bug/quirk seen live: green
+# turned magenta), unlike text_color: 0x... declared directly in YAML
+# (that one works normally). The hex values below are already inverted on purpose
+# to compensate, see docs/lessons-learned.md.
+#   green    0x57D97C -> compensated 0xA82683
+#   blue     0x4FA8E8 -> compensated 0xB05717
+#   red      0xFF3B30 -> compensated 0x00C4CF (was 0xE84C4C until 2026-10-09:
+#            looked wine/pink on the panel at 40% backlight)
+#   amber    0xF2B84B -> compensated 0x0D47B4
+script:
+  - id: apply_theme_color
+    then:
+      - lambda: |-
+          std::string c = id(theme_color_name);
+          if (c == "azul") id(theme_color_hex_value) = 0xB05717;
+          else if (c == "vermelho") id(theme_color_hex_value) = 0x00C4CF;
+          else if (c == "ambar") id(theme_color_hex_value) = 0x0D47B4;
+          else id(theme_color_hex_value) = 0xA82683;
+      # Every text and shape uses the theme color (2026-10-09 layout). Labels
+      # have no color of their own: they inherit text_color from the box they
+      # sit in, and every box uses box_style, so this one style update
+      # recolors all text. It has to be the style: LVGL's default theme gives
+      # each obj a "card" style with its own text_color, so a color set only
+      # on the outer page box never reached the labels inside the row boxes
+      # (seen on the device on 2026-10-09: only the status bar changed).
+      # Shapes are updated one by one below.
+      - lvgl.style.update:
+          id: box_style
+          text_color: !lambda return lv_color_hex(id(theme_color_hex_value));
+      - lvgl.obj.update:
+          id: batt_body
+          border_color: !lambda return lv_color_hex(id(theme_color_hex_value));
+      - lvgl.obj.update:
+          id: batt_fill
+          bg_color: !lambda return lv_color_hex(id(theme_color_hex_value));
+      - lvgl.obj.update:
+          id: batt_nub
+          bg_color: !lambda return lv_color_hex(id(theme_color_hex_value));
+      - lvgl.obj.update:
+          id: status_rule
+          bg_color: !lambda return lv_color_hex(id(theme_color_hex_value));
+      - script.execute: update_wifi_dots
+      - script.execute: update_config_screen
+
+  # Generic beep: freq in Hz, duration in ms. Used at boot, for button clicks
+  # and for the bad IAQ alert. Central mute: if "Som Geral" is off, no
+  # beep plays, no matter who called it.
+  - id: beep
+    parameters:
+      freq: float
+      dur_ms: int
+    then:
+      - if:
+          condition:
+            switch.is_on: sound_enabled
+          then:
+            - output.turn_on: buzzer_out
+            - output.ledc.set_frequency:
+                id: buzzer_out
+                frequency: !lambda return freq;
+            - output.set_level:
+                id: buzzer_out
+                level: 80%
+            - delay: !lambda return dur_ms;
+            - output.turn_off: buzzer_out
+
+  - id: apply_manual_brightness
+    then:
+      - light.turn_on:
+          id: backlight
+          brightness: !lambda |-
+            std::string b = id(brightness_level_name);
+            return atoi(b.c_str()) / 100.0f;
+
+  # Shows the page in current_page; "select ^" (points at the side button,
+  # which is on top with the device lying down) only on page 3.
+  - id: show_current_page
+    then:
+      - if:
+          condition:
+            lambda: 'return id(current_page) == 2;'
+          then:
+            - lvgl.page.show: page_details
+            - lvgl.widget.hide: select_hint
+          else:
+            - if:
+                condition:
+                  lambda: 'return id(current_page) == 3;'
+                then:
+                  - script.execute: update_config_screen
+                  - lvgl.page.show: page_config
+                  - lvgl.widget.show: select_hint
+                else:
+                  - lvgl.page.show: page_main
+                  - lvgl.widget.hide: select_hint
+
+  # Pages 2 and 3 go back to page 1 after a while untouched; every button
+  # press restarts the count (mode: restart).
+  - id: page_timeout
+    mode: restart
+    then:
+      - delay: !lambda 'return id(current_page) == 3 ? 15000 : 30000;'
+      - lambda: |-
+          id(current_page) = 1;
+          id(cfg_cursor) = 0;
+      - script.execute: show_current_page
+
+  # Screen off (Home Assistant's sleep mode): wake it on page 1 at the chosen
+  # brightness, back off 30 s after the last button press or movement.
+  - id: wake_screen
+    then:
+      - globals.set:
+          id: wake_mode
+          value: "true"
+      - lambda: |-
+          id(current_page) = 1;
+          id(cfg_cursor) = 0;
+      - script.stop: page_timeout
+      - script.execute: show_current_page
+      - script.execute: apply_manual_brightness
+      - script.execute: wake_timeout
+
+  # Power source changed (Cabo USB). On USB: poll the IMU fast for the
+  # motion wake and start a fresh reference. On battery: one read per minute,
+  # just for the board temperature.
+  - id: apply_power_source
+    then:
+      - if:
+          condition:
+            binary_sensor.is_on: usb_power
+          then:
+            - globals.set:
+                id: motion_ref_valid
+                value: "false"
+            - component.resume:
+                id: imu
+                update_interval: 200ms
+            - lvgl.widget.show: usb_icon
+          else:
+            - lvgl.widget.hide: usb_icon
+            - component.resume:
+                id: imu
+                update_interval: 60s
+
+  # Movement seen by the accelerometer. Screen off: wake it. Already awake
+  # through wake mode: keep it on. Screen on by Home Assistant: nothing.
+  - id: motion_wake
+    then:
+      - if:
+          condition:
+            light.is_off: backlight
+          then:
+            - script.execute: wake_screen
+          else:
+            - if:
+                condition:
+                  lambda: 'return id(wake_mode);'
+                then:
+                  - script.execute: wake_timeout
+
+  # Wake mode end: 30 s after the last button press, back to page 1 and the
+  # backlight off again (the state Home Assistant had left it in).
+  - id: wake_timeout
+    mode: restart
+    then:
+      - delay: 30s
+      - if:
+          condition:
+            lambda: 'return id(wake_mode);'
+          then:
+            - globals.set:
+                id: wake_mode
+                value: "false"
+            - lambda: |-
+                id(current_page) = 1;
+                id(cfg_cursor) = 0;
+            - script.stop: page_timeout
+            - script.execute: show_current_page
+            - light.turn_off: backlight
+
+  # Page 3 ON/OFF pills. Active option = filled with the theme color and
+  # black text; the other = black with theme text; cursor = theme outline,
+  # blinking (cursor_blink_on, toggled every 500 ms). Colors go through the
+  # inverted lv_color_hex() quirk: 0xFFFFFF here shows as black.
+  - id: update_config_screen
+    then:
+      - lvgl.obj.update:
+          id: pill_snd_on
+          bg_color: !lambda 'return lv_color_hex(id(iaq_beep_enabled).state ? id(theme_color_hex_value) : 0xFFFFFF);'
+          text_color: !lambda 'return lv_color_hex(id(iaq_beep_enabled).state ? 0xFFFFFF : id(theme_color_hex_value));'
+          border_color: !lambda 'return lv_color_hex(id(theme_color_hex_value));'
+          outline_color: !lambda 'return lv_color_hex(id(theme_color_hex_value));'
+          outline_width: !lambda 'return (id(cfg_cursor) == 0 && id(cursor_blink_on)) ? 2 : 0;'
+      - lvgl.obj.update:
+          id: pill_snd_off
+          bg_color: !lambda 'return lv_color_hex(!id(iaq_beep_enabled).state ? id(theme_color_hex_value) : 0xFFFFFF);'
+          text_color: !lambda 'return lv_color_hex(!id(iaq_beep_enabled).state ? 0xFFFFFF : id(theme_color_hex_value));'
+          border_color: !lambda 'return lv_color_hex(id(theme_color_hex_value));'
+          outline_color: !lambda 'return lv_color_hex(id(theme_color_hex_value));'
+          outline_width: !lambda 'return (id(cfg_cursor) == 1 && id(cursor_blink_on)) ? 2 : 0;'
+      - lvgl.obj.update:
+          id: pill_led_on
+          bg_color: !lambda 'return lv_color_hex(id(iaq_led_enabled).state ? id(theme_color_hex_value) : 0xFFFFFF);'
+          text_color: !lambda 'return lv_color_hex(id(iaq_led_enabled).state ? 0xFFFFFF : id(theme_color_hex_value));'
+          border_color: !lambda 'return lv_color_hex(id(theme_color_hex_value));'
+          outline_color: !lambda 'return lv_color_hex(id(theme_color_hex_value));'
+          outline_width: !lambda 'return (id(cfg_cursor) == 2 && id(cursor_blink_on)) ? 2 : 0;'
+      - lvgl.obj.update:
+          id: pill_led_off
+          bg_color: !lambda 'return lv_color_hex(!id(iaq_led_enabled).state ? id(theme_color_hex_value) : 0xFFFFFF);'
+          text_color: !lambda 'return lv_color_hex(!id(iaq_led_enabled).state ? 0xFFFFFF : id(theme_color_hex_value));'
+          border_color: !lambda 'return lv_color_hex(id(theme_color_hex_value));'
+          outline_color: !lambda 'return lv_color_hex(id(theme_color_hex_value));'
+          outline_width: !lambda 'return (id(cfg_cursor) == 3 && id(cursor_blink_on)) ? 2 : 0;'
+
+  # Lights N of the 4 wifi dots based on the RSSI (-55dBm=4, -65=3,
+  # -75=2, -85=1, below that=0), in the current theme color. theme_color_hex_value
+  # is already pre-compensated for the lv_color_hex() inversion bug in lambdas
+  # (see the comment above apply_theme_color). Unlit dot (2026-10-09):
+  # theme-colored ring with a black fill (0xFFFFFF = black after the quirk).
+  - id: update_wifi_dots
+    then:
+      - lvgl.obj.update:
+          id: wifi_dot_1
+          border_color: !lambda return lv_color_hex(id(theme_color_hex_value));
+          bg_color: !lambda |-
+            float rssi = id(wifi_signal_rssi).state;
+            return lv_color_hex(rssi >= -85 ? id(theme_color_hex_value) : 0xFFFFFF);
+      - lvgl.obj.update:
+          id: wifi_dot_2
+          border_color: !lambda return lv_color_hex(id(theme_color_hex_value));
+          bg_color: !lambda |-
+            float rssi = id(wifi_signal_rssi).state;
+            return lv_color_hex(rssi >= -75 ? id(theme_color_hex_value) : 0xFFFFFF);
+      - lvgl.obj.update:
+          id: wifi_dot_3
+          border_color: !lambda return lv_color_hex(id(theme_color_hex_value));
+          bg_color: !lambda |-
+            float rssi = id(wifi_signal_rssi).state;
+            return lv_color_hex(rssi >= -65 ? id(theme_color_hex_value) : 0xFFFFFF);
+      - lvgl.obj.update:
+          id: wifi_dot_4
+          border_color: !lambda return lv_color_hex(id(theme_color_hex_value));
+          bg_color: !lambda |-
+            float rssi = id(wifi_signal_rssi).state;
+            return lv_color_hex(rssi >= -55 ? id(theme_color_hex_value) : 0xFFFFFF);
+
+# --- Selects in HA (brightness and theme: set from HA only since 2026-10-09) ---
+select:
+  - platform: template
+    name: "Tema"
+    id: theme_select
+    optimistic: true
+    options: ["Verde", "Azul", "Vermelho", "Âmbar"]
+    initial_option: "Verde"
+    set_action:
+      - lambda: |-
+          if (x == "Azul") id(theme_color_name) = "azul";
+          else if (x == "Vermelho") id(theme_color_name) = "vermelho";
+          else if (x == "Âmbar") id(theme_color_name) = "ambar";
+          else id(theme_color_name) = "verde";
+      - script.execute: apply_theme_color
+
+  - platform: template
+    name: "Brilho"
+    id: brightness_select
+    optimistic: true
+    options: ["Fraco", "Forte"]
+    initial_option: "Fraco"
+    set_action:
+      - lambda: |-
+          id(brightness_level_name) = (x == "Fraco") ? "40" : "100";
+      - script.execute: apply_manual_brightness
+
+switch:
+  - platform: gpio
+    pin: GPIO4
+    id: power_hold
+    restore_mode: ALWAYS_ON
+    internal: true
+
+  # --- Alert switches, exposed to HA. All optimistic (no hardware
+  # behind them, they only control firmware logic) and on by default. ---
+  - platform: template
+    name: "Som Geral"
+    id: sound_enabled
+    icon: "mdi:volume-high"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
+  - platform: template
+    name: "Aviso Sonoro Qualidade Ar"
+    id: iaq_beep_enabled
+    icon: "mdi:bell-alert"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    # Page 3 "Aviso sonoro" shows this switch; keep it in sync when Home
+    # Assistant changes it.
+    on_turn_on:
+      - script.execute: update_config_screen
+    on_turn_off:
+      - script.execute: update_config_screen
+
+  - platform: template
+    name: "Aviso Luminoso Qualidade Ar"
+    id: iaq_led_enabled
+    icon: "mdi:led-outline"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    # Page 3 "Aviso luminoso".
+    on_turn_on:
+      - script.execute: update_config_screen
+    on_turn_off:
+      - script.execute: update_config_screen
+
+  - platform: template
+    name: "Acordar com Movimento"
+    id: motion_wake_enabled
+    icon: "mdi:motion-sensor"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
+# --- Reset/reboot: soft restart (HA + hold button A 5s), factory reset
+# (hold button B 8s: erases all saved settings incl. BSEC state, physical action only, no button in
+# HA on purpose, so it is not triggered by accident through voice/automation) ---
+button:
+  - platform: restart
+    id: restart_button
+    name: "Reiniciar"
+  - platform: factory_reset
+    id: factory_reset_button
+    internal: true
+
+# --- Physical buttons (2026-10-09, device lying down, USB-C on the right):
+# A (M5) = next page; on page 3 it walks the cursor (sound ON, sound OFF,
+# light ON, light OFF) and the next press goes back to page 1.
+# B (side, on top) = on page 3 applies the option under the cursor and stays
+# there; no action on pages 1 and 2.
+# Screen off (Home Assistant's sleep mode turns the backlight off): the first
+# A press only wakes it on page 1; it goes dark again 30 s after the last
+# press (wake_mode). Click beeps stay silent in wake mode (night). ---
+binary_sensor:
+  # The PLUS2 has no pin or power chip that reports USB power, so it is
+  # inferred from the battery voltage: on the cable the ADC reads 4.15-4.26 V
+  # and stays flat for hours (checked 2026-10-03 to 10-13); on battery it
+  # falls under load. Hysteresis keeps it from flapping: on at >= 4.13 V,
+  # off below 4.10 V. Updated at the battery read pace (5 min).
+  - platform: template
+    id: usb_power
+    name: "Cabo USB"
+    device_class: plug
+    entity_category: diagnostic
+    # Without this, on_state skips the first state after boot (ESPHome
+    # 2025+), so the bolt stayed hidden and the IMU stuck at 60 s (seen
+    # 2026-10-13).
+    trigger_on_initial_state: true
+    on_state:
+      then:
+        - script.execute: apply_power_source
+
+  - platform: gpio
+    id: btn_a
+    pin:
+      number: GPIO37
+      mode: INPUT
+      inverted: true
+    on_click:
+      then:
+        - if:
+            condition:
+              light.is_off: backlight
+            then:
+              - script.execute: wake_screen
+            else:
+              - if:
+                  condition:
+                    lambda: 'return !id(wake_mode);'
+                  then:
+                    - script.execute:
+                        id: beep
+                        freq: 1800
+                        dur_ms: 25
+              - lambda: |-
+                  int p = id(current_page);
+                  if (p == 1) {
+                    id(current_page) = 2;
+                  } else if (p == 2) {
+                    id(current_page) = 3;
+                    id(cfg_cursor) = 0;
+                  } else if (id(cfg_cursor) < 3) {
+                    id(cfg_cursor) += 1;
+                  } else {
+                    id(current_page) = 1;
+                    id(cfg_cursor) = 0;
+                  }
+                  id(cursor_blink_on) = true;
+              - script.execute: show_current_page
+              - if:
+                  condition:
+                    lambda: 'return id(current_page) == 1;'
+                  then:
+                    - script.stop: page_timeout
+                  else:
+                    - script.execute: page_timeout
+              - if:
+                  condition:
+                    lambda: 'return id(wake_mode);'
+                  then:
+                    - script.execute: wake_timeout
+    on_press:
+      then:
+        - delay: 5s
+        - if:
+            condition:
+              binary_sensor.is_on: btn_a
+            then:
+              - button.press: restart_button
+
+  - platform: gpio
+    id: btn_b
+    pin:
+      number: GPIO39
+      mode: INPUT
+      inverted: true
+    on_click:
+      then:
+        - if:
+            condition:
+              lambda: 'return id(current_page) == 3;'
+            then:
+              - if:
+                  condition:
+                    lambda: 'return !id(wake_mode);'
+                  then:
+                    - script.execute:
+                        id: beep
+                        freq: 1800
+                        dur_ms: 25
+                  else:
+                    - script.execute: wake_timeout
+              # The switch triggers update_config_screen itself.
+              - lambda: |-
+                  switch (id(cfg_cursor)) {
+                    case 0: id(iaq_beep_enabled).turn_on(); break;
+                    case 1: id(iaq_beep_enabled).turn_off(); break;
+                    case 2: id(iaq_led_enabled).turn_on(); break;
+                    default: id(iaq_led_enabled).turn_off(); break;
+                  }
+              - script.execute: page_timeout
+    on_press:
+      then:
+        - delay: 8s
+        - if:
+            condition:
+              binary_sensor.is_on: btn_b
+            then:
+              - button.press: factory_reset_button
+
+# --- I2C: two separate buses (Grove != internal, see header) ---
+i2c:
+  - id: bus_grove
+    sda: GPIO32
+    scl: GPIO33
+    scan: true
+  - id: bus_internal
+    sda: GPIO21
+    scl: GPIO22
+    scan: true
+
+# --- Ambient sensor (BME688 / ENV Pro) via BSEC2, real IAQ 0-500 ---
+bme68x_bsec2_i2c:
+  id: bsec2_hub
+  i2c_id: bus_grove
+  address: 0x77
+  model: BME688
+  algorithm_output: classification
+  operating_age: 28d
+  sample_rate: LP
+  state_save_interval: 1h
+  # Was 6h: every reboot before that threw away the BSEC calibration and IAQ
+  # fell back to "Uncertain" (seen on 2026-09-09).
+  # Self-heating compensation (2026-10-09), subtracted inside BSEC so
+  # temperature, humidity and IAQ are all corrected. Measured in the LEGO
+  # case with the ENV Pro ~2 cm from the StickC, 160 MHz, Wi-Fi light,
+  # screen at 40%: median error +1.83 C against the reference (p10 +1.78,
+  # p90 +1.84, AC off, 14:40-15:25). Without the case it was +1.25 C.
+  # Re-measure if the mounting, CPU, Wi-Fi or brightness change.
+  temperature_offset: ${temperature_offset}
+
+# Clock for the "Último Boot" timestamp only (no schedules run on it; the
+# screen policy stays in Home Assistant, see lessons-learned.md).
+time:
+  - platform: homeassistant
+    id: ha_time
+
+sensor:
+  # BSEC2 LP mode outputs every 3 s; 60 s averages cut the Home Assistant
+  # history ~20x (was ~300k states in 10 days) and smooth the readings. The
+  # screen and the IAQ alert read the averaged value.
+  - platform: bme68x_bsec2
+    bme68x_bsec2_id: bsec2_hub
+    temperature:
+      id: env_temperature
+      name: "Temperatura"
+      filters:
+        - throttle_average: 60s
+    humidity:
+      id: env_humidity
+      name: "Umidade"
+      filters:
+        - throttle_average: 60s
+    pressure:
+      id: env_pressure
+      name: "Pressão"
+      filters:
+        - throttle_average: 300s
+    gas_resistance:
+      id: env_gas_resistance
+      name: "Resistência de Gás"
+      filters:
+        - throttle_average: 300s
+    iaq:
+      id: env_iaq
+      name: "IAQ"
+      filters:
+        - throttle_average: 60s
+
+  # Protection kit: board temperature from the MPU6886 IMU die on the
+  # internal bus (the ESP32 internal_temperature is unreliable on the
+  # classic ESP32). Also the reference for a future dynamic BSEC
+  # temperature offset (self-heating, see docs/lessons-learned.md).
+  # Since 2026-10-13 the IMU is polled every 200 ms for the motion wake, but
+  # only on USB power (apply_power_source); it boots at 60 s until the first
+  # battery read. The accelerometer stays internal (no Home Assistant
+  # traffic) and the board temperature is averaged to one value per minute.
+  - platform: mpu6886
+    id: imu
+    i2c_id: bus_internal
+    address: 0x68
+    update_interval: 60s
+    accel_x:
+      id: accel_x
+      internal: true
+    accel_y:
+      id: accel_y
+      internal: true
+    # Published after x and y in the same read, so all three are fresh here.
+    accel_z:
+      id: accel_z
+      internal: true
+      on_value:
+        then:
+          - if:
+              condition:
+                and:
+                  - switch.is_on: motion_wake_enabled
+                  - binary_sensor.is_on: usb_power
+                  - lambda: |-
+                      float ax = id(accel_x).state, ay = id(accel_y).state, az = x;
+                      if (!id(motion_ref_valid)) {
+                        id(motion_ref_x) = ax;
+                        id(motion_ref_y) = ay;
+                        id(motion_ref_z) = az;
+                        id(motion_ref_valid) = true;
+                        return false;
+                      }
+                      float dx = ax - id(motion_ref_x);
+                      float dy = ay - id(motion_ref_y);
+                      float dz = az - id(motion_ref_z);
+                      // Reference follows with a ~2 s time constant at 200 ms.
+                      const float k = 0.1f;
+                      id(motion_ref_x) += k * dx;
+                      id(motion_ref_y) += k * dy;
+                      id(motion_ref_z) += k * dz;
+                      const float t = ${motion_threshold};
+                      return dx * dx + dy * dy + dz * dz > t * t;
+              then:
+                - script.execute: motion_wake
+    temperature:
+      id: board_temperature
+      name: "Temperatura Placa"
+      entity_category: diagnostic
+      filters:
+        - throttle_average: 60s
+
+  - platform: adc
+    pin: GPIO38
+    id: battery_voltage
+    name: "Bateria Voltagem"
+    # 5 min: the device lives on the charger (2026-10-08 network diet).
+    update_interval: 300s
+    attenuation: 12db
+    filters:
+      - multiply: 2.0
+    on_value:
+      then:
+        - lambda: |-
+            bool on = id(usb_power).state;
+            if (!id(usb_power).has_state()) id(usb_power).publish_state(x >= 4.12f);
+            else if (!on && x >= 4.13f) id(usb_power).publish_state(true);
+            else if (on && x < 4.10f) id(usb_power).publish_state(false);
+
+  - platform: wifi_signal
+    id: wifi_signal_rssi
+    name: "Wifi Sinal"
+    # 5 min (also refreshes the on-screen dots at that pace).
+    update_interval: 300s
+    on_value:
+      then:
+        - script.execute: update_wifi_dots
+
+  - platform: copy
+    source_id: battery_voltage
+    id: battery_percent
+    name: "Bateria"
+    unit_of_measurement: "%"
+    device_class: battery
+    filters:
+      - calibrate_linear:
+          - 3.27 -> 0.0
+          - 4.15 -> 100.0
+      - clamp:
+          min_value: 0.0
+          max_value: 100.0
+
+  # Boot time as a timestamp: changes only when the device really restarts
+  # (unlike "Motivo do Reset", which is re-sent on every Home Assistant
+  # restart), so it is the trigger for the unexpected-restart alert.
+  - platform: uptime
+    type: timestamp
+    name: "Último Boot"
+    time_id: ha_time
+    entity_category: diagnostic
+
+  # Free heap / largest heap block / free PSRAM / loop time sensors and the uptime in
+  # seconds were removed on 2026-10-08: they served the 2026-09 reboot
+  # investigation (then 258 h without a reboot) and nothing used them. To
+  # debug again, add back a "platform: debug" sensor with free/block/psram/
+  # loop_time.
+
+text_sensor:
+  - platform: debug
+    reset_reason:
+      name: "Motivo do Reset"
+      entity_category: diagnostic
+
+  - platform: bme68x_bsec2
+    bme68x_bsec2_id: bsec2_hub
+    iaq_accuracy:
+      id: env_iaq_accuracy
+      name: "IAQ Precisão"
+
+# --- Display + LVGL ---
+spi:
+  clk_pin: GPIO13
+  mosi_pin: GPIO15
+
+output:
+  - platform: ledc
+    pin: GPIO27
+    id: backlight_pwm
+  # Built-in Plus2 buzzer (GPIO2, inverted, confirmed by the community)
+  - platform: ledc
+    pin: GPIO2
+    inverted: true
+    id: buzzer_out
+  # Onboard red LED, GPIO19 (shared with IR, not used here, see
+  # docs/hardware-wiring.md). Polarity NOT confirmed on hardware yet:
+  # if it lights up the opposite of what is expected, swap inverted: true/false.
+  - platform: gpio
+    pin: GPIO19
+    id: alert_led_out
+    inverted: false
+
+light:
+  - platform: monochromatic
+    output: backlight_pwm
+    id: backlight
+    name: "Tela Brilho"
+    restore_mode: ALWAYS_ON
+    # The default gamma_correct (2.8) distorts the scale: 20% requested brightness is
+    # ~1% real duty cycle (the LED does not light), 40%~8%, 60%~24%, too low
+    # for the backlight. Linear (1.0) makes the requested % match the real %.
+    gamma_correct: 1.0
+
+display:
+  - platform: mipi_spi
+    id: main_display
+    model: ST7789V
+    cs_pin: GPIO5
+    dc_pin: GPIO14
+    reset_pin: GPIO12
+    # Native portrait dimensions/offsets; the landscape rotation is set in
+    # the lvgl: block (LVGL refuses rotation here).
+    dimensions:
+      width: 135
+      height: 240
+      offset_width: 52
+      offset_height: 40
+    data_rate: 40MHz
+
+# Montserrat needs glyphsets + explicit glyphs for Portuguese accents.
+font:
+  # Status bar (battery %, "select ^").
+  - file: "gfonts://Montserrat"
+    id: font_label
+    size: 11
+    glyphsets: [GF_Latin_Core]
+    glyphs: ["áãâàéêíóôõúüç", "ÁÃÂÀÉÊÍÓÔÕÚÜÇ", "°Ω·"]
+  # Row labels on pages 1 and 2, ON/OFF pills.
+  - file: "gfonts://Montserrat"
+    id: font_label14
+    size: 14
+    glyphsets: [GF_Latin_Core]
+    glyphs: ["áãâàéêíóôõúüç", "ÁÃÂÀÉÊÍÓÔÕÚÜÇ", "°Ω·"]
+  # Row labels on page 3.
+  - file: "gfonts://Montserrat"
+    id: font_value
+    size: 16
+    glyphsets: [GF_Latin_Core]
+    glyphs: ["áãâàéêíóôõúüç", "ÁÃÂÀÉÊÍÓÔÕÚÜÇ", "°Ω·"]
+  # Values on page 2.
+  - file:
+      type: gfonts
+      family: Montserrat
+      weight: 600
+    id: font_val22
+    size: 22
+    glyphsets: [GF_Latin_Core]
+    glyphs: ["áãâàéêíóôõúüç", "ÁÃÂÀÉÊÍÓÔÕÚÜÇ", "°Ω·"]
+  # Values on page 1.
+  - file:
+      type: gfonts
+      family: Montserrat
+      weight: 600
+    id: font_val32
+    size: 32
+    glyphsets: [GF_Latin_Core]
+    glyphs: ["áãâàéêíóôõúüç", "ÁÃÂÀÉÊÍÓÔÕÚÜÇ", "°Ω·"]
+
+# Layout (2026-10-09, preview approved by the user): 240x135 landscape. The
+# status bar (rows 0-16) lives on the top layer, so it shows on every page;
+# each page draws its rows in a box from y=17 to the bottom. Rows are boxes
+# themselves: label aligned LEFT_MID (x: 6), value RIGHT_MID (x: -6), with
+# no y offset (see the align + y warning in docs/display-ui.md).
+# All colors: theme color only. Static colors below are the green theme;
+# apply_theme_color repaints everything at boot and on every theme change.
+lvgl:
+  displays:
+    - main_display
+  color_depth: 16
+  # 90 since 2026-10-09: device lying down with the USB-C on the right
+  # (content turned 90 degrees clockwise). LVGL hands it to the mipi_spi
+  # driver, which rotates in hardware (MADCTL).
+  rotation: 90
+  style_definitions:
+    # Invisible container: no background, border, padding or scrolling.
+    # Also carries the theme text color for every label inside it (updated
+    # by apply_theme_color).
+    - id: box_style
+      bg_opa: TRANSP
+      border_width: 0
+      pad_all: 0
+      radius: 0
+      text_color: 0x57D97C
+    - id: pill_style
+      bg_opa: COVER
+      bg_color: 0x000000
+      border_width: 1
+      border_color: 0x57D97C
+      radius: 13
+      pad_all: 0
+      outline_width: 0
+      outline_pad: 3
+      outline_color: 0x57D97C
+      text_color: 0x57D97C
+
+  top_layer:
+    widgets:
+      - obj:
+          id: status_bar
+          styles: box_style
+          x: 0
+          y: 0
+          width: 240
+          height: 17
+          scrollable: false
+          clickable: false
+          widgets:
+            - label:
+                id: select_hint
+                x: 5
+                y: 1
+                text_font: font_label
+                text: "select ^"
+                hidden: true
+            # 4 Wi-Fi dots: lit = filled, unlit = ring (update_wifi_dots).
+            - obj:
+                id: wifi_dot_1
+                x: 143
+                y: 5
+                width: 6
+                height: 6
+                radius: 3
+                pad_all: 0
+                bg_color: 0x000000
+                border_width: 1
+                border_color: 0x57D97C
+            - obj:
+                id: wifi_dot_2
+                x: 151
+                y: 5
+                width: 6
+                height: 6
+                radius: 3
+                pad_all: 0
+                bg_color: 0x000000
+                border_width: 1
+                border_color: 0x57D97C
+            - obj:
+                id: wifi_dot_3
+                x: 159
+                y: 5
+                width: 6
+                height: 6
+                radius: 3
+                pad_all: 0
+                bg_color: 0x000000
+                border_width: 1
+                border_color: 0x57D97C
+            - obj:
+                id: wifi_dot_4
+                x: 167
+                y: 5
+                width: 6
+                height: 6
+                radius: 3
+                pad_all: 0
+                bg_color: 0x000000
+                border_width: 1
+                border_color: 0x57D97C
+            # Lightning bolt while on USB power (Cabo USB). LVGL's built-in
+            # Montserrat carries the symbol font (U+F0E7 = LV_SYMBOL_CHARGE);
+            # the gfonts Montserrat does not. Inherits the theme text color.
+            - label:
+                id: usb_icon
+                x: 176
+                y: 2
+                text_font: montserrat_12
+                text: ""
+                hidden: true
+            - label:
+                id: batt_pct
+                align: TOP_RIGHT
+                x: -25
+                y: 1
+                text_font: font_label
+                text: "--%"
+            # Battery icon: outline + fill (width = 12 px * %) + nub.
+            - obj:
+                id: batt_body
+                styles: box_style
+                x: 219
+                y: 4
+                width: 16
+                height: 9
+                radius: 2
+                border_width: 1
+                border_color: 0x57D97C
+            - obj:
+                id: batt_fill
+                x: 221
+                y: 6
+                width: 12
+                height: 5
+                radius: 1
+                pad_all: 0
+                border_width: 0
+                bg_color: 0x57D97C
+            - obj:
+                id: batt_nub
+                x: 235
+                y: 6
+                width: 2
+                height: 4
+                radius: 1
+                pad_all: 0
+                border_width: 0
+                bg_color: 0x57D97C
+            - obj:
+                id: status_rule
+                x: 0
+                y: 16
+                width: 240
+                height: 1
+                radius: 0
+                pad_all: 0
+                border_width: 0
+                bg_color: 0x57D97C
+                bg_opa: 35%
+
+  pages:
+    # Page 1: temperature, humidity, air quality ("Bom"/"Médio"/"Ruim").
+    - id: page_main
+      widgets:
+        - obj:
+            id: p1_box
+            styles: box_style
+            x: 0
+            y: 17
+            width: 240
+            height: 118
+            scrollable: false
+            widgets:
+              - obj:
+                  styles: box_style
+                  x: 0
+                  y: 0
+                  width: 240
+                  height: 39
+                  scrollable: false
+                  widgets:
+                    - label:
+                        align: LEFT_MID
+                        x: 6
+                        text_font: font_label14
+                        text: "Temperatura"
+                    - label:
+                        id: p1_temp
+                        align: RIGHT_MID
+                        x: -6
+                        text_font: font_val32
+                        text: "--.-°C"
+              - obj:
+                  styles: box_style
+                  x: 0
+                  y: 39
+                  width: 240
+                  height: 40
+                  scrollable: false
+                  widgets:
+                    - label:
+                        align: LEFT_MID
+                        x: 6
+                        text_font: font_label14
+                        text: "Umidade"
+                    - label:
+                        id: p1_hum
+                        align: RIGHT_MID
+                        x: -6
+                        text_font: font_val32
+                        text: "--%"
+              - obj:
+                  styles: box_style
+                  x: 0
+                  y: 79
+                  width: 240
+                  height: 39
+                  scrollable: false
+                  widgets:
+                    - label:
+                        align: LEFT_MID
+                        x: 6
+                        text_font: font_label14
+                        text: "Qualidade do ar"
+                    - label:
+                        id: p1_air
+                        align: RIGHT_MID
+                        x: -6
+                        text_font: font_val32
+                        text: "---"
+
+    # Page 2: pressure, gas resistance, IAQ, IAQ accuracy.
+    - id: page_details
+      widgets:
+        - obj:
+            id: p2_box
+            styles: box_style
+            x: 0
+            y: 17
+            width: 240
+            height: 118
+            scrollable: false
+            widgets:
+              - obj:
+                  styles: box_style
+                  x: 0
+                  y: 0
+                  width: 240
+                  height: 30
+                  scrollable: false
+                  widgets:
+                    - label:
+                        align: LEFT_MID
+                        x: 6
+                        text_font: font_label14
+                        text: "Pressão"
+                    - label:
+                        id: p2_press
+                        align: RIGHT_MID
+                        x: -6
+                        text_font: font_val22
+                        text: "--- hPa"
+              - obj:
+                  styles: box_style
+                  x: 0
+                  y: 30
+                  width: 240
+                  height: 29
+                  scrollable: false
+                  widgets:
+                    - label:
+                        align: LEFT_MID
+                        x: 6
+                        text_font: font_label14
+                        text: "Gás"
+                    - label:
+                        id: p2_gas
+                        align: RIGHT_MID
+                        x: -6
+                        text_font: font_val22
+                        text: "-- kΩ"
+              - obj:
+                  styles: box_style
+                  x: 0
+                  y: 59
+                  width: 240
+                  height: 30
+                  scrollable: false
+                  widgets:
+                    - label:
+                        align: LEFT_MID
+                        x: 6
+                        text_font: font_label14
+                        text: "IAQ"
+                    - label:
+                        id: p2_iaq
+                        align: RIGHT_MID
+                        x: -6
+                        text_font: font_val22
+                        text: "---"
+              - obj:
+                  styles: box_style
+                  x: 0
+                  y: 89
+                  width: 240
+                  height: 29
+                  scrollable: false
+                  widgets:
+                    - label:
+                        align: LEFT_MID
+                        x: 6
+                        text_font: font_label14
+                        text: "Precisão"
+                    - label:
+                        id: p2_acc
+                        align: RIGHT_MID
+                        x: -6
+                        text_font: font_val22
+                        text: "---"
+
+    # Page 3: settings. Pills: ON at x -60, OFF at x -6 from the right edge.
+    - id: page_config
+      widgets:
+        - obj:
+            id: p3_box
+            styles: box_style
+            x: 0
+            y: 17
+            width: 240
+            height: 118
+            scrollable: false
+            widgets:
+              - obj:
+                  styles: box_style
+                  x: 0
+                  y: 0
+                  width: 240
+                  height: 59
+                  scrollable: false
+                  widgets:
+                    - label:
+                        align: LEFT_MID
+                        x: 6
+                        text_font: font_value
+                        text: "Aviso sonoro"
+                    - obj:
+                        id: pill_snd_on
+                        styles: pill_style
+                        align: RIGHT_MID
+                        x: -60
+                        width: 46
+                        height: 26
+                        scrollable: false
+                        widgets:
+                          - label:
+                              align: CENTER
+                              text_font: font_label14
+                              text: "ON"
+                    - obj:
+                        id: pill_snd_off
+                        styles: pill_style
+                        align: RIGHT_MID
+                        x: -6
+                        width: 46
+                        height: 26
+                        scrollable: false
+                        widgets:
+                          - label:
+                              align: CENTER
+                              text_font: font_label14
+                              text: "OFF"
+              - obj:
+                  styles: box_style
+                  x: 0
+                  y: 59
+                  width: 240
+                  height: 59
+                  scrollable: false
+                  widgets:
+                    - label:
+                        align: LEFT_MID
+                        x: 6
+                        text_font: font_value
+                        text: "Aviso luminoso"
+                    - obj:
+                        id: pill_led_on
+                        styles: pill_style
+                        align: RIGHT_MID
+                        x: -60
+                        width: 46
+                        height: 26
+                        scrollable: false
+                        widgets:
+                          - label:
+                              align: CENTER
+                              text_font: font_label14
+                              text: "ON"
+                    - obj:
+                        id: pill_led_off
+                        styles: pill_style
+                        align: RIGHT_MID
+                        x: -6
+                        width: 46
+                        height: 26
+                        scrollable: false
+                        widgets:
+                          - label:
+                              align: CENTER
+                              text_font: font_label14
+                              text: "OFF"
+
+# --- Red LED blink while IAQ is "Ruim" (iaq_alert_active,
+# set in the main interval below). Own interval (500ms), separate
+# from the screen's 10s one, just so the blink logic is not coupled to the update of the
+# sensors. The "Aviso Luminoso Qualidade Ar" switch (iaq_led_enabled) turns it off. ---
+interval:
+  - interval: 500ms
+    then:
+      - if:
+          condition:
+            and:
+              - lambda: 'return id(iaq_alert_active);'
+              - switch.is_on: iaq_led_enabled
+          then:
+            - lambda: 'id(alert_led_state) = !id(alert_led_state);'
+            - if:
+                condition:
+                  lambda: 'return id(alert_led_state);'
+                then:
+                  - output.turn_on: alert_led_out
+                else:
+                  - output.turn_off: alert_led_out
+          else:
+            - output.turn_off: alert_led_out
+            - lambda: 'id(alert_led_state) = false;'
+      # Page 3 cursor blink (same 500 ms tick).
+      - if:
+          condition:
+            lambda: 'return id(current_page) == 3;'
+          then:
+            - lambda: 'id(cursor_blink_on) = !id(cursor_blink_on);'
+            - script.execute: update_config_screen
+
+  # --- Screen refresh (10s, reduced from 5s/1s for stability, see
+  # docs/lessons-learned.md on screen freezes after days of uptime). Updates all pages,
+  # including the hidden ones, so a page switch never shows stale values. ---
+  - interval: 10s
+    then:
+      - lvgl.label.update:
+          id: p1_temp
+          text: !lambda |-
+            if (id(env_temperature).has_state())
+              return str_sprintf("%.1f°C", id(env_temperature).state);
+            return std::string("--.-°C");
+      - lvgl.label.update:
+          id: p1_hum
+          text: !lambda |-
+            if (id(env_humidity).has_state())
+              return str_sprintf("%.0f%%", id(env_humidity).state);
+            return std::string("--%");
+      - lvgl.label.update:
+          id: p1_air
+          text: !lambda |-
+            if (id(env_iaq).has_state()) {
+              float v = id(env_iaq).state;
+              if (v < 100) return std::string("Bom");
+              if (v < 200) return std::string("Médio");
+              return std::string("Ruim");
+            }
+            return std::string("---");
+      - lvgl.label.update:
+          id: p2_press
+          text: !lambda |-
+            if (id(env_pressure).has_state())
+              return str_sprintf("%.0f hPa", id(env_pressure).state);
+            return std::string("--- hPa");
+      - lvgl.label.update:
+          id: p2_gas
+          text: !lambda |-
+            if (id(env_gas_resistance).has_state())
+              return str_sprintf("%.0f kΩ", id(env_gas_resistance).state / 1000.0f);
+            return std::string("-- kΩ");
+      - lvgl.label.update:
+          id: p2_iaq
+          text: !lambda |-
+            if (id(env_iaq).has_state())
+              return str_sprintf("%.0f", id(env_iaq).state);
+            return std::string("---");
+      # BSEC2 accuracy text translated for the screen (Home Assistant keeps
+      # the original English state).
+      - lvgl.label.update:
+          id: p2_acc
+          text: !lambda |-
+            if (!id(env_iaq_accuracy).has_state()) return std::string("---");
+            std::string a = id(env_iaq_accuracy).state;
+            if (a == "Stabilizing") return std::string("Estabilizando");
+            if (a == "Uncertain") return std::string("Incerto");
+            if (a == "Calibrating") return std::string("Calibrando");
+            if (a == "Calibrated") return std::string("Calibrado");
+            return a;
+      # Alert beep only on the TRANSITION to "Ruim" (does not repeat all the time
+      # while the air stays bad); resets when it improves again.
+      - if:
+          condition:
+            lambda: |-
+              return id(env_iaq).has_state() && id(env_iaq).state >= 200 && !id(iaq_alert_active);
+          then:
+            - globals.set:
+                id: iaq_alert_active
+                value: "true"
+            - if:
+                condition:
+                  switch.is_on: iaq_beep_enabled
+                then:
+                  - script.execute:
+                      id: beep
+                      freq: 2500
+                      dur_ms: 600
+      - if:
+          condition:
+            lambda: |-
+              return id(env_iaq).has_state() && id(env_iaq).state < 200 && id(iaq_alert_active);
+          then:
+            - globals.set:
+                id: iaq_alert_active
+                value: "false"
+      - lvgl.label.update:
+          id: batt_pct
+          text: !lambda |-
+            if (id(battery_percent).has_state())
+              return str_sprintf("%.0f%%", id(battery_percent).state);
+            return std::string("--%");
+      - lvgl.obj.update:
+          id: batt_fill
+          width: !lambda |-
+            if (!id(battery_percent).has_state()) return 1;
+            int w = (int) roundf(12.0f * id(battery_percent).state / 100.0f);
+            return w < 1 ? 1 : w;

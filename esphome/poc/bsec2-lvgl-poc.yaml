@@ -1,0 +1,183 @@
+# =============================================================================
+# STICKC ENV QUARTO - POC Phase 2: BSEC2 (real IAQ) + minimal LVGL
+# =============================================================================
+# Goal: validate that the real sensor (BME688/ENV Pro, already physically moved
+# to the StickC Grove port) + BSEC2 + a minimal LVGL screen run stably together
+# for several hours, BEFORE investing in the full Phase 3 UI. It isolates "does it run?"
+# from "does it look good?": just 1 label on screen with the live IAQ value.
+#
+# bme68x_bsec2_i2c is a NATIVE ESPHome component (no need for
+# external_components); it only needs to be in the installed version (2026.7.1 here).
+# By including this component you agree to the Bosch BSEC2 license (there is
+# no separate acceptance flag, just use it).
+#
+# Two I2C buses kept separate on purpose; do NOT mix them:
+# - bus_grove (BME688, where the ENV Pro is connected): SDA=32 SCL=33
+# - bus_internal (the StickC's factory IMU MPU6886 + RTC BM8563): SDA=21 SCL=22
+#
+# Exit criteria:
+# 1. Runs stably for several hours without heap exhaustion / watchdog reset
+#    (watch the serial logger).
+# 2. Binary size still fits comfortably in the M5Launcher partition
+#    (Phase 1 baseline: ~923KB in a ~3.75MB partition).
+# 3. Confirm in the log that BSEC2 is running (look for lines with
+#    "iaq_accuracy"/"bsec" in the log); the IAQ reading starts unstable/0 and
+#    stabilizes over ~5 days, which is expected (not a bug).
+#
+# Adjust after seeing the real screen: the display's rotation/mirror_x/mirror_y
+# (the value below is an initial guess, not tested on hardware yet).
+#
+# secrets.yaml: stickc_env_quarto_api_key / stickc_env_quarto_ota_password
+#               stickc_env_quarto_ap_password / wifi_ssid / wifi_password
+# =============================================================================
+
+substitutions:
+  name: stickc-env-quarto
+  friendly_name: StickC Env Quarto
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  min_version: 2026.6.0
+  on_boot:
+    - priority: 800
+      then:
+        - switch.turn_on: power_hold
+
+esp32:
+  variant: esp32
+  flash_size: 8MB
+  cpu_frequency: 240MHz
+  framework:
+    type: esp-idf
+
+psram:
+  mode: quad
+  speed: 80MHz
+
+api:
+  encryption:
+    key: !secret stickc_env_quarto_api_key
+
+ota:
+  - platform: esphome
+    password: !secret stickc_env_quarto_ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "StickC-Env-Quarto Fallback"
+    password: !secret stickc_env_quarto_ap_password
+
+logger:
+  level: DEBUG
+  logs:
+    sensor: WARN
+
+captive_portal:
+
+switch:
+  - platform: gpio
+    pin: GPIO4
+    id: power_hold
+    restore_mode: ALWAYS_ON
+    internal: true
+
+# --- I2C: two separate buses, Grove (sensor) != internal (IMU/RTC) ---
+i2c:
+  - id: bus_grove
+    sda: GPIO32
+    scl: GPIO33
+    scan: true
+  - id: bus_internal
+    sda: GPIO21
+    scl: GPIO22
+    scan: true
+
+# --- Ambient sensor (BME688 / ENV Pro on the Grove port) via BSEC2 ---
+bme68x_bsec2_i2c:
+  id: bsec2_hub
+  i2c_id: bus_grove
+  address: 0x77
+  model: BME688
+  algorithm_output: classification
+  sample_rate: LP
+  state_save_interval: 6h
+
+sensor:
+  - platform: bme68x_bsec2
+    bme68x_bsec2_id: bsec2_hub
+    temperature:
+      name: "Temperatura"
+    humidity:
+      name: "Umidade"
+    pressure:
+      name: "Pressão"
+    gas_resistance:
+      name: "Resistência de Gás"
+    iaq:
+      id: iaq_sensor
+      name: "IAQ"
+
+text_sensor:
+  - platform: bme68x_bsec2
+    bme68x_bsec2_id: bsec2_hub
+    iaq_accuracy:
+      name: "IAQ Precisão"
+
+# --- Minimal display + LVGL (just to prove it runs alongside BSEC2) ---
+spi:
+  clk_pin: GPIO13
+  mosi_pin: GPIO15
+
+output:
+  - platform: ledc
+    pin: GPIO27
+    id: backlight_pwm
+
+light:
+  - platform: monochromatic
+    output: backlight_pwm
+    id: backlight
+    restore_mode: ALWAYS_ON
+
+display:
+  - platform: mipi_spi
+    id: main_display
+    model: ST7789V
+    cs_pin: GPIO5
+    dc_pin: GPIO14
+    reset_pin: GPIO12
+    rotation: 0
+    invert_colors: false
+    dimensions:
+      width: 135
+      height: 240
+      offset_width: 52
+      offset_height: 40
+    data_rate: 40MHz
+
+lvgl:
+  displays:
+    - main_display
+  color_depth: 16
+  pages:
+    - id: poc_page
+      widgets:
+        - label:
+            id: iaq_label
+            align: CENTER
+            text_font: montserrat_20
+            text: "IAQ: --"
+
+interval:
+  - interval: 5s
+    then:
+      - lvgl.label.update:
+          id: iaq_label
+          text: !lambda |-
+            if (id(iaq_sensor).has_state()) {
+              return str_sprintf("IAQ: %.0f", id(iaq_sensor).state);
+            }
+            return "IAQ: --";

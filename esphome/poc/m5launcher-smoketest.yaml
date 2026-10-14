@@ -1,0 +1,99 @@
+# =============================================================================
+# STICKC ENV QUARTO - POC Phase 1: M5Launcher smoke test
+# =============================================================================
+# Goal: validate ONLY the loading mechanics via M5Launcher (OTA/app partition
+# switch + reboot) before investing in sensor/UI. No display, no BME688,
+# no LVGL; just wifi + api + ota + 1 LED blinking on GPIO19.
+#
+# Exit criteria:
+# 1. Boots via M5Launcher (WebUI; the Plus2 has no SD slot).
+# 2. Once running, test whether "esphome upload" (wireless OTA) still
+#    works on this binary loaded by M5Launcher; if it does not,
+#    every Phase 3 iteration has to go through the M5Launcher WebUI again.
+# 3. Record the size of the compiled .bin as a baseline to compare against the
+#    partition M5Launcher allocates (BSEC2+LVGL will inflate it a lot).
+#
+# Hardware: M5StickC PLUS2 (ESP32-PICO-V3-02, 2MB PSRAM quad, 8MB flash,
+# no AXP192). Onboard red LED: GPIO19 (shared with IR TX).
+#
+# secrets.yaml: stickc_env_quarto_api_key / stickc_env_quarto_ota_password
+#               stickc_env_quarto_ap_password / wifi_ssid / wifi_password
+# =============================================================================
+
+substitutions:
+  name: stickc-env-quarto
+  friendly_name: StickC Env Quarto
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  min_version: 2026.6.0
+  on_boot:
+    - priority: 800
+      then:
+        - switch.turn_on: power_hold
+    - priority: 600
+      then:
+        - light.turn_on:
+            id: led_status
+            effect: "Blink"
+
+esp32:
+  variant: esp32
+  flash_size: 8MB
+  cpu_frequency: 240MHz
+  framework:
+    type: esp-idf
+
+psram:
+  mode: quad
+  speed: 80MHz
+
+api:
+  encryption:
+    key: !secret stickc_env_quarto_api_key
+
+ota:
+  - platform: esphome
+    password: !secret stickc_env_quarto_ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "StickC-Env-Quarto Fallback"
+    password: !secret stickc_env_quarto_ap_password
+
+logger:
+  level: DEBUG
+  logs:
+    sensor: WARN
+
+captive_portal:
+
+# Keeps the device powered on battery (no AXP192 to do it by itself).
+switch:
+  - platform: gpio
+    pin: GPIO4
+    id: power_hold
+    restore_mode: ALWAYS_ON
+    internal: true
+
+output:
+  - platform: gpio
+    pin: GPIO19
+    id: led_out
+
+light:
+  - platform: binary
+    name: "LED Onboard"
+    output: led_out
+    id: led_status
+    effects:
+      - strobe:
+          name: "Blink"
+          colors:
+            - state: true
+              duration: 500ms
+            - state: false
+              duration: 500ms

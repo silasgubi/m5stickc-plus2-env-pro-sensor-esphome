@@ -1,0 +1,8 @@
+.snapshots/
+secrets.yaml
+secrets.yaml.bak
+*.bin
+.private/
+.esphome/
+build/
+*.code-workspace
