@@ -884,14 +884,22 @@ spi:
   mosi_pin: GPIO15
 
 output:
+  # Fixed LEDC channels on separate timers (ESPHome: timer = channel / 2).
+  # Auto-assigned, the backlight (ch 0) and the buzzer (ch 1) shared timer 0:
+  # every beep's set_frequency retuned the backlight PWM too, and on
+  # 2026-10-15 the 2500 Hz IAQ alert beeps left the screen dark while the
+  # light entity still read "on" (button A and motion did not wake it, only
+  # toggling the light in Home Assistant did). See docs/lessons-learned.md.
   - platform: ledc
     pin: GPIO27
     id: backlight_pwm
+    channel: 0
   # Built-in Plus2 buzzer (GPIO2, inverted, confirmed by the community)
   - platform: ledc
     pin: GPIO2
     inverted: true
     id: buzzer_out
+    channel: 2
   # Onboard red LED, GPIO19 (shared with IR, not used here, see
   # docs/hardware-wiring.md). Polarity NOT confirmed on hardware yet:
   # if it lights up the opposite of what is expected, swap inverted: true/false.

@@ -220,3 +220,17 @@ circuit: using `mode: INPUT_PULLUP` fails ESPHome's validation
 ("GPIO37 (34-39) does not support pullups"). The M5Stack board already has
 external pull-ups on these lines; use plain `mode: INPUT` with
 `inverted: true`.
+
+## Two LEDC outputs on adjacent channels share one timer
+
+ESPHome picks the LEDC timer as `channel / 2`, so auto-assigned channels 0
+and 1 run on the same timer. The backlight (GPIO27) and the buzzer (GPIO2)
+landed there: every `output.ledc.set_frequency` for a beep retuned the
+backlight PWM as well, and its duty no longer matched the new bit depth
+(1000 Hz = 16 bits, 2500 Hz = 14 bits, so 40% brightness is out of range).
+On 2026-10-15 the 2500 Hz IAQ alert beeps (11:19 to 11:35) left the screen
+dark while the light entity still read "on"; button A and motion wake did
+nothing because both check `light.is_off`. Toggling the light in Home
+Assistant brought it back. Fix: fixed `channel: 0` (backlight) and
+`channel: 2` (buzzer), one timer each. Any time one LEDC output changes
+frequency at runtime, give it a channel on its own timer.
