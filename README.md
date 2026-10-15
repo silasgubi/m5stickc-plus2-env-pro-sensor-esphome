@@ -265,6 +265,38 @@ language of the household this was built for. To translate it, edit
 | Device name | `StickC Env Quarto` ("quarto" = bedroom), hostname `stickc-env-quarto`, fallback access point `StickC-Env-Quarto Fallback` | `friendly_name` and `name` under `substitutions:`; the access point name is the `ssid:` under `wifi:` → `ap:` (not driven by the substitutions) |
 | Select options | `Tema`: `Verde`, `Azul`, `Vermelho`, `Âmbar`; `Brilho`: `Fraco`, `Forte` | `options:` and `initial_option:` of each select, **and** the same strings in its `set_action` lambda and in the `on_boot` sync lambdas (under `esphome:`), or the select stops matching |
 
+### pt-BR to English
+
+| pt-BR | English | Used for |
+|---|---|---|
+| `Temperatura` | Temperature | sensor, screen label |
+| `Umidade` | Humidity | sensor, screen label |
+| `Pressão` | Pressure | sensor, screen label |
+| `Resistência de Gás` | Gas resistance | sensor |
+| `Gás` | Gas | screen label |
+| `Qualidade do ar` | Air quality | screen label |
+| `Precisão` / `IAQ Precisão` | Accuracy / IAQ accuracy | screen label, sensor |
+| `Bateria` | Battery | sensor |
+| `Bateria Voltagem` | Battery voltage | sensor |
+| `Wifi Sinal` | Wi-Fi signal | sensor |
+| `Temperatura Placa` | Board temperature | sensor |
+| `Último Boot` | Last boot | sensor (timestamp) |
+| `Motivo do Reset` | Reset reason | sensor |
+| `Cabo USB` | USB cable (on USB power) | binary sensor |
+| `Tela Brilho` | Screen backlight | light |
+| `Tema` | Theme | select |
+| `Brilho` | Brightness | select |
+| `Som Geral` | All sounds | switch |
+| `Aviso Sonoro Qualidade Ar` / `Aviso sonoro` | Air quality sound alert | switch, screen label |
+| `Aviso Luminoso Qualidade Ar` / `Aviso luminoso` | Air quality light alert | switch, screen label |
+| `Acordar com Movimento` | Wake on motion | switch |
+| `Reiniciar` | Restart | button |
+| `Bom` / `Médio` / `Ruim` | Good / Moderate / Bad | air quality on screen |
+| `Estabilizando` / `Incerto` / `Calibrando` / `Calibrado` | Stabilizing / Uncertain / Calibrating / Calibrated | IAQ accuracy on screen |
+| `Fraco` / `Forte` | Low (40%) / High (100%) | brightness options |
+| `Verde` / `Azul` / `Vermelho` / `Âmbar` | Green / Blue / Red / Amber | theme options |
+| `Quarto` | Bedroom | device name |
+
 Rename entities before adding the device to Home Assistant: entity IDs are
 created from these names on first discovery. The fonts carry an explicit
 `glyphs:` list for Portuguese accents (`font:` block); add the accented
