@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.0.1 (2026-10-15)
+
+- **Fix: screen dark after an IAQ alert beep**: the backlight and the
+  buzzer were on auto-assigned LEDC channels 0 and 1, which share one
+  timer, so every beep retuned the backlight PWM. The 2500 Hz IAQ alert
+  left the screen dark while `Tela Brilho` still read "on", and neither
+  the M5 button nor motion woke it (only toggling the light in Home
+  Assistant did). The backlight is now on `channel: 0` and the buzzer on
+  `channel: 2`, one timer each.
+
 ## 2.0.0 (2026-10-14)
 
 Breaking UI change: the screen is now landscape with three pages, and the
